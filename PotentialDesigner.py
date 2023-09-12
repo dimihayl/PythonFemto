@@ -21,13 +21,30 @@ SBATCH_BASE += ' /home/ktas/gu47det/DimiSoftware/UsmaniLayeredFitAnalysis/Usmani
 
 FmToNu = 5.067731237e-3
 
-studyR = optuna.create_study(direction='minimize', sampler=optuna.samplers.RandomSampler())
+#studyR = optuna.create_study(direction='minimize', sampler=optuna.samplers.RandomSampler())
 studyT = optuna.create_study(direction='minimize', sampler=optuna.samplers.TPESampler())
 
 par1_range = [0, 0]
 par2_range = [0, 0]
 par3_range = [0, 0]
 par4_range = [0, 0]
+
+#par[0] are the number of pars in the ERE
+def fit_scattering_pars(x, par):
+    MOM = x[0]
+    Npars = round(par[0])
+    #print(Npars)
+    if Npars==0:
+        return 0
+    ERE = 0
+    if Npars>=1:
+        ERE += 1./(par[1]*FmToNu)
+    if Npars>=2:
+        ERE += 0.5*MOM*MOM*par[2]*FmToNu
+    if Npars>=3:
+        for iPar in range(2,Npars):
+            ERE += par[iPar+1] * (FmToNu**(iPar*2-1)) * (MOM**(iPar*2))
+    return math.atan(MOM/ERE)
 
 # Target function to be optimized by Optuna
 def target_function(trial):
@@ -86,6 +103,7 @@ def main():
     FIT_TIMEOUT = 1#in minutes
     TIMEOUT = 20#in minutes
     WakeUp = 2.5#in seconds
+    nPars = 3
 
     if not os.path.exists(filename_arg):
         sys.exit(f"The file '{filename_arg}' does not exist.")
@@ -274,6 +292,17 @@ def main():
                     sys.exit("Error: CPU must be positive.")
                 if CPU>32:
                     sys.exit("Error: CPU must be <= 32.")
+            if line_split[0].lower()=='npars':
+                if len(line_split)!=2:
+                    sys.exit('Wrong set up of nPars')
+                if not line_split[1].isdigit():
+                    sys.exit('nPars is not a digit')
+                nPars = int(line_split[1])
+                if nPars<=0:
+                    sys.exit("Error: nPars must be positive.")
+                if nPars>8:
+                    sys.exit("Error: nPars must be <= 8.")
+
             if line_split[0].lower()=='timeout':
                 if len(line_split)!=2:
                     sys.exit('Wrong set up of TIMEOUT')
@@ -359,6 +388,7 @@ def main():
             ps_file.Close()
 
         elif PW==0:
+            PhaseShifts = 'FIT_F0_D0_DIRECTLY'
             PS_TO_FIT = ROOT.TH1F("PS_TO_FIT","PS_TO_FIT",kBin,kMin,kMax)
             for uMom in range(0,kBin):
                 MOM = PS_TO_FIT.GetBinCenter(uMom+1)
@@ -468,31 +498,47 @@ def main():
                         hPhaseShifts = root_file.Get("hPhaseShifts")
                         hPotential = root_file.Get("hPotential")
                         Estimator = 0.0
-                        for uMom in range(0,kBin):
-                            MOM = hPhaseShifts.GetBinCenter(uMom+1)
-                            #a dummy error that has linear scaling. This is to consider that we have extra terms to ERE at large k*
-                            ERR = 0.01*MOM
-                            kCotGoal = MOM/math.tan(hPhaseShifts.GetBinContent(uMom+1))
-                            kCotFit = MOM/math.tan(Graph_PS_TO_FIT.Eval(MOM))
-                            #Estimator += (hPhaseShifts.GetBinContent(uMom+1)-Graph_PS_TO_FIT.Eval(MOM))**2
-                            Estimator += ( (kCotGoal-kCotFit)/ERR )**2
+                        if PhaseShifts=='FIT_F0_D0_DIRECTLY':
+                            fit_ps_def = ROOT.TF1("fit_ps_def",fit_scattering_pars,kMin,kMax,nPars+1)
+                            fit_ps_def.FixParameter(0,nPars)
+                            fit_ps_def.SetParameter(1,f_goal)
+                            fit_ps_def.SetParameter(2,d_goal)
+                            for iPar in range(2,nPars):
+                                fit_ps_def.SetParameter(iPar+1,0)
+                            for uMom in range(0,kBin):
+                                MOM = hPhaseShifts.GetBinCenter(uMom+1)
+                                hPhaseShifts.SetBinError(uMom+1,0.001)
+                            hPhaseShifts.Fit(fit_ps_def, "Q, S, N, R, M")
+                            Current_f = fit_ps_def.GetParameter(1)
+                            Current_d = fit_ps_def.GetParameter(2)
+                            Estimator += ( (Current_f-f_goal)/f_err )**2
+                            Estimator += ( (Current_d-d_goal)/d_err )**2
+                        else:
+                            for uMom in range(0,kBin):
+                                MOM = hPhaseShifts.GetBinCenter(uMom+1)
+                                #a dummy error that has linear scaling. This is to consider that we have extra terms to ERE at large k*
+                                ERR = 0.01*MOM
+                                kCotGoal = MOM/math.tan(hPhaseShifts.GetBinContent(uMom+1))
+                                kCotFit = MOM/math.tan(Graph_PS_TO_FIT.Eval(MOM))
+                                #Estimator += (hPhaseShifts.GetBinContent(uMom+1)-Graph_PS_TO_FIT.Eval(MOM))**2
+                                Estimator += ( (kCotGoal-kCotFit)/ERR )**2
                         if BestEstimator>Estimator:
                             #BestTrial = TrialsCPU[iCPU]
                             for uMom in range(0,kBin):
                                 hPhaseShifts.SetBinError(uMom+1,0.001)
-                            #fit_ps = ROOT.TF1("fit_ps","math.atan(MOM/(1./(f_goal*FmToNu)+0.5*MOM*MOM*d_goal*FmToNu))")
-                            fit_ps = ROOT.TF1("fit_ps","TMath::ATan(x/(1./[0]+0.5*x*x*[1]))",kMin,kMax)
-                            fit_ps.SetParameter(0, f_goal*FmToNu)
-                            fit_ps.SetParameter(1, d_goal*FmToNu)
+                            fit_ps = ROOT.TF1("fit_ps",fit_scattering_pars,kMin,kMax,nPars+1)
+                            fit_ps.FixParameter(0,nPars)
+                            fit_ps.SetParameter(1,f_goal)
+                            fit_ps.SetParameter(2,d_goal)
+                            for iPar in range(2,nPars):
+                                fit_ps.SetParameter(iPar+1,0)
+                            #fit_ps = ROOT.TF1("fit_ps","TMath::ATan(x/(1./[0]/5.067731237e-3+0.5*x*x*[1]*5.067731237e-3))",kMin,kMax)
+                            #fit_ps.SetParameter(0,f_goal)
+                            #fit_ps.SetParameter(1,d_goal)
                             hPhaseShifts.Fit(fit_ps, "Q, S, N, R, M")
-                            Best_f = fit_ps.GetParameter(0)/FmToNu
-                            Best_d = fit_ps.GetParameter(1)/FmToNu
-                            #check if the sign is correct. Any wrong sign brings in a penalty
-                            #if Best_f*f_goal<0:
-                            #    Estimator *= 100
-                            #if Best_d*d_goal<0:
-                            #    Estimator *= 100
-                            #if BestEstimator>Estimator:
+                            Best_f = fit_ps.GetParameter(1)
+                            Best_d = fit_ps.GetParameter(2)
+
                             BestEstimator = Estimator
                             Best_par1 = CurrentPar1[iCPU]
                             Best_par2 = CurrentPar2[iCPU]
