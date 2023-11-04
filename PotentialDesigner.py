@@ -7,17 +7,7 @@ import subprocess
 import time
 import shutil
 
-CPU_HOURS = 24
-
 script_name = "/home/dimihayl/Software/LocalFemto/bin/PotentialDesignerEngine"
-
-#sinfo: kta,long,xtralong
-SBATCH_BASE = 'sbatch --partition=long'
-SBATCH_BASE += ' --mem-per-cpu=1000'
-SBATCH_BASE += ' --time='+str(CPU_HOURS*60)
-SBATCH_BASE += ' --job-name=PotDes'
-#SBATCH_BASE += ' --constraint=INTEL'
-SBATCH_BASE += ' /home/ktas/gu47det/DimiSoftware/UsmaniLayeredFitAnalysis/UsmaniLayeredFit_Fitter.sh'
 
 FmToNu = 5.067731237e-3
 
@@ -30,20 +20,45 @@ par3_range = [0, 0]
 par4_range = [0, 0]
 
 #par[0] are the number of pars in the ERE
+#par[1] is the q1q2*RedMass (0 if no Coulomb)
 def fit_scattering_pars(x, par):
     MOM = x[0]
     Npars = round(par[0])
+    q1q2rm = par[1]
     #print(Npars)
     if Npars==0:
         return 0
     ERE = 0
     if Npars>=1:
-        ERE += 1./(par[1]*FmToNu)
+        ERE += 1./(par[2]*FmToNu)
     if Npars>=2:
-        ERE += 0.5*MOM*MOM*par[2]*FmToNu
+        ERE += 0.5*MOM*MOM*par[3]*FmToNu
     if Npars>=3:
         for iPar in range(2,Npars):
-            ERE += par[iPar+1] * (FmToNu**(iPar*2-1)) * (MOM**(iPar*2))
+            ERE += par[iPar+2] * (FmToNu**(iPar*2-1)) * (MOM**(iPar*2))
+
+    if q1q2rm!=0:
+        PreFactor = 1
+        AddFactor = 0       
+        AlphaFS = 0.0072973525664
+        EulerConst = 0.57721566490153
+        Eta = AlphaFS*q1q2rm/MOM
+        hgam = -EulerConst - math.log(Eta)
+        PreFactor = (math.exp(2.*math.pi*Eta)-1.)/2.*math.pi*Eta
+        AddFactor = -2.*MOM*Eta*hgam
+        precision = 1
+        eps = 0.0001
+        nstep = 1
+        while precision>eps and nstep<32:
+            dh = Eta*Eta/(nstep*(nstep*nstep+Eta*Eta));
+            hgam += dh
+            #this says we have to take at least the first two terms of the sum
+            if nstep>1:
+                precision = abs(dh/hgam);
+            nstep += 1
+        ERE += AddFactor
+        ERE *= PreFactor
+
     return math.atan(MOM/ERE)
 
 # Target function to be optimized by Optuna
@@ -391,8 +406,11 @@ def main():
             PhaseShifts = 'FIT_F0_D0_DIRECTLY'
             PS_TO_FIT = ROOT.TH1F("PS_TO_FIT","PS_TO_FIT",kBin,kMin,kMax)
             for uMom in range(0,kBin):
-                MOM = PS_TO_FIT.GetBinCenter(uMom+1)
-                ps_val = math.atan(MOM/(1./(f_goal*FmToNu)+0.5*MOM*MOM*d_goal*FmToNu))
+                MOM = []
+                MOM.append(PS_TO_FIT.GetBinCenter(uMom+1))
+                #ps_val = math.atan(MOM/(1./(f_goal*FmToNu)+0.5*MOM*MOM*d_goal*FmToNu))
+                PARS = [2,q1q2*(M1*M2)/(M1+M2),f_goal,d_goal]
+                ps_val = fit_scattering_pars(MOM,PARS)
                 PS_TO_FIT.SetBinContent(uMom+1,ps_val)
         else:
             sys.exit("ERROR: To study l!=0 on has to provide the phase shifts as a direct input!")
@@ -499,18 +517,19 @@ def main():
                         hPotential = root_file.Get("hPotential")
                         Estimator = 0.0
                         if PhaseShifts=='FIT_F0_D0_DIRECTLY':
-                            fit_ps_def = ROOT.TF1("fit_ps_def",fit_scattering_pars,kMin,kMax,nPars+1)
+                            fit_ps_def = ROOT.TF1("fit_ps_def",fit_scattering_pars,kMin,kMax,nPars+2)
                             fit_ps_def.FixParameter(0,nPars)
-                            fit_ps_def.SetParameter(1,f_goal)
-                            fit_ps_def.SetParameter(2,d_goal)
-                            for iPar in range(2,nPars):
-                                fit_ps_def.SetParameter(iPar+1,0)
+                            fit_ps_def.FixParameter(1,q1q2*(M1*M2)/(M1+M2))
+                            fit_ps_def.SetParameter(2,f_goal)
+                            fit_ps_def.SetParameter(3,d_goal)
+                            for iPar in range(4,nPars+2):
+                                fit_ps_def.SetParameter(iPar,0)
                             for uMom in range(0,kBin):
                                 MOM = hPhaseShifts.GetBinCenter(uMom+1)
                                 hPhaseShifts.SetBinError(uMom+1,0.001)
                             hPhaseShifts.Fit(fit_ps_def, "Q, S, N, R, M")
-                            Current_f = fit_ps_def.GetParameter(1)
-                            Current_d = fit_ps_def.GetParameter(2)
+                            Current_f = fit_ps_def.GetParameter(2)
+                            Current_d = fit_ps_def.GetParameter(3)
                             Estimator += ( (Current_f-f_goal)/f_err )**2
                             Estimator += ( (Current_d-d_goal)/d_err )**2
                         else:
@@ -526,18 +545,19 @@ def main():
                             #BestTrial = TrialsCPU[iCPU]
                             for uMom in range(0,kBin):
                                 hPhaseShifts.SetBinError(uMom+1,0.001)
-                            fit_ps = ROOT.TF1("fit_ps",fit_scattering_pars,kMin,kMax,nPars+1)
+                            fit_ps = ROOT.TF1("fit_ps",fit_scattering_pars,kMin,kMax,nPars+2)
                             fit_ps.FixParameter(0,nPars)
-                            fit_ps.SetParameter(1,f_goal)
-                            fit_ps.SetParameter(2,d_goal)
-                            for iPar in range(2,nPars):
-                                fit_ps.SetParameter(iPar+1,0)
+                            fit_ps.FixParameter(1,q1q2*(M1*M2)/(M1+M2))
+                            fit_ps.SetParameter(2,f_goal)
+                            fit_ps.SetParameter(3,d_goal)
+                            for iPar in range(4,nPars+2):
+                                fit_ps.SetParameter(iPar,0)
                             #fit_ps = ROOT.TF1("fit_ps","TMath::ATan(x/(1./[0]/5.067731237e-3+0.5*x*x*[1]*5.067731237e-3))",kMin,kMax)
                             #fit_ps.SetParameter(0,f_goal)
                             #fit_ps.SetParameter(1,d_goal)
                             hPhaseShifts.Fit(fit_ps, "Q, S, N, R, M")
-                            Best_f = fit_ps.GetParameter(1)
-                            Best_d = fit_ps.GetParameter(2)
+                            Best_f = fit_ps.GetParameter(2)
+                            Best_d = fit_ps.GetParameter(3)
 
                             BestEstimator = Estimator
                             Best_par1 = CurrentPar1[iCPU]
@@ -546,8 +566,14 @@ def main():
                             Best_par4 = CurrentPar4[iCPU]
                             f_err_current = abs(Best_f-f_goal)
                             d_err_current = abs(Best_d-d_goal)
-                            Progress_f = f_err/f_err_current
-                            Progress_d = d_err/d_err_current
+                            if f_err_current==0:
+                                Progress_f = 1
+                            else:
+                                Progress_f = f_err/f_err_current
+                            if d_err_current==0: 
+                                Progress_d = 1
+                            else:
+                                Progress_d = d_err/d_err_current
                             # The message you want to update
                             if Progress_f>1:
                                 Progress_f = 1
