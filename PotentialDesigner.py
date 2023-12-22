@@ -14,14 +14,18 @@ FmToNu = 5.067731237e-3
 #studyR = optuna.create_study(direction='minimize', sampler=optuna.samplers.RandomSampler())
 studyT = optuna.create_study(direction='minimize', sampler=optuna.samplers.TPESampler())
 
+#these are the ranges of the Gaussian potential parameters, which we would like to study
 par1_range = [0, 0]
 par2_range = [0, 0]
 par3_range = [0, 0]
 par4_range = [0, 0]
 
+#evalates the phase shift at a given k*, given the scattering parameters and q1q2*RedMass of the pair
 #par[0] are the number of pars in the ERE
 #par[1] is the q1q2*RedMass (0 if no Coulomb)
+#par[2...] the parameters of the effective range expansion
 def fit_scattering_pars(x, par):
+    #print('fcall')
     MOM = x[0]
     Npars = round(par[0])
     q1q2rm = par[1]
@@ -58,7 +62,7 @@ def fit_scattering_pars(x, par):
             nstep += 1
         ERE += AddFactor
         ERE *= PreFactor
-
+    #print('fend')
     return math.atan(MOM/ERE)
 
 # Target function to be optimized by Optuna
@@ -113,6 +117,8 @@ def main():
     PhaseShifts = ""
     kMin = 0
     kMax = 100
+    kMaxFit = 100
+    PsMinErr = 1e-6
     kBin = 50
     CPU = 1
     FIT_TIMEOUT = 1#in minutes
@@ -249,6 +255,22 @@ def main():
                     sys.exit("Error: kMax must be a number.")
                 if kMax<=0:
                     sys.exit("Error: kMax must be positive.")
+            if line_split[0].lower()=='kmaxfit':
+                if len(line_split)!=2:
+                    sys.exit('Wrong set up of kMaxFit')
+                try:
+                    kMaxFit = float(line_split[1])  # Try converting the string to a float
+                except ValueError:
+                    sys.exit("Error: kMaxFit must be a number.")
+                if kMaxFit<=0:
+                    sys.exit("Error: kMaxFit must be positive.")
+            if line_split[0].lower()=='psminerr':
+                if len(line_split)!=2:
+                    sys.exit('Wrong set up of PsMinErr')
+                try:
+                    PsMinErr = float(line_split[1])  # Try converting the string to a float
+                except ValueError:
+                    sys.exit("Error: PsMinErr must be a number.")
             if line_split[0].lower()=='kbin':
                 if len(line_split)!=2:
                     sys.exit('Wrong set up of kMax')
@@ -292,11 +314,16 @@ def main():
                 if not line_split[1].isdigit():
                     sys.exit('Coulomb is not a digit')
                 q1q2 = int(line_split[1])
+            #phaseshifts FILENAME HISTONAME chi2_goal/ndf
             if line_split[0].lower()=='phaseshifts':
-                if len(line_split)!=3:
+                if len(line_split)!=4:
                     sys.exit('Wrong set up of PhaseShifts')
                 PhaseShifts = line_split[1]
                 PhaseShiftsHisto = line_split[2]
+                try:
+                    PS_Chi2ndf_goal = float(line_split[3])  # Try converting the string to a float
+                except ValueError:
+                    sys.exit("Error: PS_Chi2ndf_goal must be a number. The input should be phaseshifts FILENAME HISTONAME chi2_goal/ndf.")
             if line_split[0].lower()=='cpu':
                 if len(line_split)!=2:
                     sys.exit('Wrong set up of CPU')
@@ -369,6 +396,8 @@ def main():
             sys.exit("Error: kMin should be small, certainly not above 100 MeV!")
         if kMin>=kMax:
             sys.exit("Error: kMin should be smaller than kMax!")
+        if kMaxFit>kMax:
+            kMaxFit = kMax
         if kMax<0:
             sys.exit("Error: kMax cannot be negative!")
         if kBin<=0:
@@ -396,9 +425,10 @@ def main():
                 sys.exit(f"The file '{PhaseShifts}' cannot be opened.")
 
             PS_TO_FIT = ps_file.Get(PhaseShiftsHisto)
+            PS_TO_FIT.SetDirectory(ROOT.gROOT)
+
             if not PS_TO_FIT:
                 sys.exit(f"The histogram: '{PhaseShiftsHisto}' could not be retrieved")
-
             # Close the ROOT file when you're done
             ps_file.Close()
 
@@ -414,16 +444,20 @@ def main():
                 PS_TO_FIT.SetBinContent(uMom+1,ps_val)
         else:
             sys.exit("ERROR: To study l!=0 on has to provide the phase shifts as a direct input!")
-        PS_TO_FIT.SetName("PS_TO_FIT")
+        #PS_TO_FIT.SetName("PS_TO_FIT")
 
         Graph_PS_TO_FIT = ROOT.TGraph()
         Graph_PS_TO_FIT.SetName("Graph_PS_TO_FIT")
-        for uMom in range(0,kBin):
+        for uMom in range(0,PS_TO_FIT.GetNbinsX()):
             MOM = PS_TO_FIT.GetBinCenter(uMom+1)
             Graph_PS_TO_FIT.SetPoint(uMom,MOM,PS_TO_FIT.GetBinContent(uMom+1))
 
         #ROOT_FILE = ROOT.TFile.Open(ROOT_FILE_NAME,'recreate')
         #PS_TO_FIT.Write()
+
+        if PhaseShifts != 'FIT_F0_D0_DIRECTLY':
+            f_err = PS_Chi2ndf_goal
+            d_err = PS_Chi2ndf_goal
 
         f_err_current = f_err*10
         d_err_current = d_err*10
@@ -437,6 +471,9 @@ def main():
         Best_par4 = 0
         Progress_f = 0
         Progress_d = 0
+
+        #print(f_err)
+        #print(d_err)
 
         TotExeTime = 0
         StartTime = time.time()/60.
@@ -514,72 +551,113 @@ def main():
                     try:
                         root_file = ROOT.TFile.Open(FilesOut[iCPU])
                         hPhaseShifts = root_file.Get("hPhaseShifts")
+                        for uMom in range(0,hPhaseShifts.GetNbinsX()):
+                            hPhaseShifts.SetBinError(uMom+1,0.001)
+
                         hPotential = root_file.Get("hPotential")
                         Estimator = 0.0
                         if PhaseShifts=='FIT_F0_D0_DIRECTLY':
-                            fit_ps_def = ROOT.TF1("fit_ps_def",fit_scattering_pars,kMin,kMax,nPars+2)
+                            fit_ps_def = ROOT.TF1("fit_ps_def",fit_scattering_pars,kMin,kMaxFit,nPars+2)
                             fit_ps_def.FixParameter(0,nPars)
                             fit_ps_def.FixParameter(1,q1q2*(M1*M2)/(M1+M2))
                             fit_ps_def.SetParameter(2,f_goal)
                             fit_ps_def.SetParameter(3,d_goal)
                             for iPar in range(4,nPars+2):
                                 fit_ps_def.SetParameter(iPar,0)
-                            for uMom in range(0,kBin):
-                                MOM = hPhaseShifts.GetBinCenter(uMom+1)
-                                hPhaseShifts.SetBinError(uMom+1,0.001)
+                            #for uMom in range(0,kBin):
+                            #    MOM = hPhaseShifts.GetBinCenter(uMom+1)
+                            #    hPhaseShifts.SetBinError(uMom+1,0.001)
                             hPhaseShifts.Fit(fit_ps_def, "Q, S, N, R, M")
                             Current_f = fit_ps_def.GetParameter(2)
                             Current_d = fit_ps_def.GetParameter(3)
                             Estimator += ( (Current_f-f_goal)/f_err )**2
                             Estimator += ( (Current_d-d_goal)/d_err )**2
                         else:
-                            for uMom in range(0,kBin):
-                                MOM = hPhaseShifts.GetBinCenter(uMom+1)
-                                #a dummy error that has linear scaling. This is to consider that we have extra terms to ERE at large k*
-                                ERR = 0.01*MOM
-                                kCotGoal = MOM/math.tan(hPhaseShifts.GetBinContent(uMom+1))
-                                kCotFit = MOM/math.tan(Graph_PS_TO_FIT.Eval(MOM))
-                                #Estimator += (hPhaseShifts.GetBinContent(uMom+1)-Graph_PS_TO_FIT.Eval(MOM))**2
-                                Estimator += ( (kCotGoal-kCotFit)/ERR )**2
+                            gPhaseShifts = ROOT.TGraph()
+                            gPhaseShifts.SetName("gPhaseShifts")
+                            for uMom in range(0,hPhaseShifts.GetNbinsX()):
+                                gPhaseShifts.SetPoint(uMom, hPhaseShifts.GetBinCenter(uMom+1), hPhaseShifts.GetBinContent(uMom+1))
+                            for uMom in range(0,PS_TO_FIT.GetNbinsX()):
+                                MOM = PS_TO_FIT.GetBinCenter(uMom+1)
+                                if PS_TO_FIT.GetBinError(uMom+1)==0:
+                                    #a dummy error that has linear scaling. This is to consider that we have extra terms to ERE at large k*
+                                    ERR = 0.01*MOM
+                                else:
+                                    ERR = PS_TO_FIT.GetBinError(uMom+1)
+                                if ERR < PsMinErr:
+                                    ERR = PsMinErr
+                                    PS_TO_FIT.SetBinError(uMom+1,ERR)
+
+                                #kCotGoal = MOM/math.tan(gPhaseShifts.Eval(MOM))
+                                #kCotFit = MOM/math.tan(Graph_PS_TO_FIT.Eval(MOM))
+                                Estimator += ((gPhaseShifts.Eval(MOM)-Graph_PS_TO_FIT.Eval(MOM))/ERR)**2
+                                #print("MOM = {:.0f} gPS = {:.3f} gPSTF = {:.3f}+/-{:.3f} EST = {:.5f}".format(MOM,gPhaseShifts.Eval(MOM),Graph_PS_TO_FIT.Eval(MOM),ERR,Estimator))
+                                #Estimator += ( (kCotGoal-kCotFit)/ERR )**2
+                            Estimator /= PS_TO_FIT.GetNbinsX()
                         if BestEstimator>Estimator:
+                            #print(Estimator)
                             #BestTrial = TrialsCPU[iCPU]
-                            for uMom in range(0,kBin):
+                            for uMom in range(0,hPhaseShifts.GetNbinsX()):
                                 hPhaseShifts.SetBinError(uMom+1,0.001)
-                            fit_ps = ROOT.TF1("fit_ps",fit_scattering_pars,kMin,kMax,nPars+2)
+                            fit_ps = ROOT.TF1("fit_ps",fit_scattering_pars,kMin,kMaxFit,nPars+2)
                             fit_ps.FixParameter(0,nPars)
                             fit_ps.FixParameter(1,q1q2*(M1*M2)/(M1+M2))
-                            fit_ps.SetParameter(2,f_goal)
-                            fit_ps.SetParameter(3,d_goal)
+                            if f_goal!=0:
+                                fit_ps.SetParameter(2,f_goal)
+                                fit_ps.SetParameter(3,d_goal)
+                            elif hPhaseShifts.GetBinContent(1)>0:
+                                fit_ps.SetParameter(2,1)
+                                fit_ps.SetParameter(3,2)
+                            else:
+                                fit_ps.SetParameter(2,-1)
+                                fit_ps.SetParameter(3,2)
+
                             for iPar in range(4,nPars+2):
                                 fit_ps.SetParameter(iPar,0)
                             #fit_ps = ROOT.TF1("fit_ps","TMath::ATan(x/(1./[0]/5.067731237e-3+0.5*x*x*[1]*5.067731237e-3))",kMin,kMax)
                             #fit_ps.SetParameter(0,f_goal)
                             #fit_ps.SetParameter(1,d_goal)
-                            hPhaseShifts.Fit(fit_ps, "Q, S, N, R, M")
-                            Best_f = fit_ps.GetParameter(2)
-                            Best_d = fit_ps.GetParameter(3)
+
+                            #evaluate the scattering pars if we have an s-wave
+                            if PW==0:
+                                #print('about to fit')
+                                hPhaseShifts.Fit(fit_ps, "Q, S, N, R, M")
+                                #print('done')
+                                Best_f = fit_ps.GetParameter(2)
+                                Best_d = fit_ps.GetParameter(3)
+                            else:
+                                Best_f = 0
+                                Best_d = 0
 
                             BestEstimator = Estimator
                             Best_par1 = CurrentPar1[iCPU]
                             Best_par2 = CurrentPar2[iCPU]
                             Best_par3 = CurrentPar3[iCPU]
                             Best_par4 = CurrentPar4[iCPU]
-                            f_err_current = abs(Best_f-f_goal)
-                            d_err_current = abs(Best_d-d_goal)
-                            if f_err_current==0:
-                                Progress_f = 1
+
+                            if PhaseShifts == 'FIT_F0_D0_DIRECTLY':
+                                f_err_current = abs(Best_f-f_goal)
+                                d_err_current = abs(Best_d-d_goal)
+                                if f_err_current==0:
+                                    Progress_f = 1
+                                else:
+                                    Progress_f = f_err/f_err_current
+                                if d_err_current==0: 
+                                    Progress_d = 1
+                                else:
+                                    Progress_d = d_err/d_err_current
+                                # The message you want to update
+                                if Progress_f>1:
+                                    Progress_f = 1
+                                if Progress_d>1:
+                                    Progress_d = 1
+                                print(f"Progress: f({Progress_f*100:.1f} %) = {Best_f:.3f} fm     d({Progress_d*100:.1f} %) = {Best_d:.3f} fm        ", end="\r")
                             else:
-                                Progress_f = f_err/f_err_current
-                            if d_err_current==0: 
-                                Progress_d = 1
-                            else:
-                                Progress_d = d_err/d_err_current
-                            # The message you want to update
-                            if Progress_f>1:
-                                Progress_f = 1
-                            if Progress_d>1:
-                                Progress_d = 1
-                            print(f"Progress: f({Progress_f*100:.1f} %) = {Best_f:.3f} fm     d({Progress_d*100:.1f} %) = {Best_d:.3f} fm        ", end="\r")
+                                f_err_current = Estimator
+                                d_err_current = Estimator
+                                print(f"Progress: {PS_Chi2ndf_goal/Estimator*100:.1f} %", end="\r")
+                                
+
                             best_file = ROOT.TFile.Open(BaseFileName+"_BestSolution.root","recreate")
                             Graph_PS_TO_FIT.Write()
                             hPhaseShifts.Write()
